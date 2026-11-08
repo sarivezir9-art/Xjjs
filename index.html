@@ -1,0 +1,1087 @@
+<!DOCTYPE html>
+<html lang="az"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>VR Kinoteatr</title>
+<style>
+html,body{margin:0;height:100%;background:#000;overflow:hidden;font-family:sans-serif}
+#eyes{position:fixed;inset:0;display:none}
+#gl{position:absolute;inset:0;width:100%;height:100%}
+.vc{display:block;width:100%;height:100%;background:#000}
+.layer{position:absolute;top:0;height:100%;width:50%;overflow:hidden}
+#LL{left:0}
+#LL,#LL *{pointer-events:none}
+#LL iframe{pointer-events:auto}
+#eyes{touch-action:none}
+.dot{position:absolute;left:50%;top:50%;width:12px;height:12px;margin:-6px;border-radius:50%;background:rgba(255,255,255,.92);box-shadow:0 0 0 2px rgba(0,0,0,.55);pointer-events:none;z-index:5}
+#LR{left:50%}
+#LR,#LR *{pointer-events:none!important}
+#ui{position:fixed;inset:0;background:#111;color:#fff;display:flex;flex-direction:column;
+ gap:12px;align-items:center;justify-content:center;padding:20px;text-align:center}
+#ui input{width:90%;max-width:480px;padding:12px;font-size:16px}
+#ui button{padding:12px 28px;font-size:18px}
+#ui label.btn{padding:12px 28px;font-size:22px;background:#eee;color:#000;border-radius:6px;cursor:pointer}
+.th{position:relative}
+.th span{position:absolute;left:4px;bottom:2px;font-size:14px}
+.th img{width:96px;height:48px;object-fit:cover;border-radius:6px;display:block}
+#ui .th button{position:absolute;top:0;right:0;padding:2px 7px;font-size:14px;border-radius:6px}
+</style>
+<script type="importmap">
+{"imports":{
+ "three":"https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+ "three/addons/":"https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"}}
+</script>
+</head><body>
+
+<div id="ui">
+ <input id="link" placeholder="🔗  https://">
+ <label class="btn"><span id="tb">🖼 +</span><input id="tfile" type="file" accept="image/*,video/*" multiple hidden></label>
+ <div id="tlist" style="display:flex;flex-wrap:wrap;gap:8px;justify-content:center"></div>
+ <button id="gb">G</button>
+ <button id="go">▶</button>
+</div>
+
+<div id="eyes">
+ <canvas id="gl"></canvas>
+ <div class="layer" id="LL"><i class="dot"></i></div>
+ <div class="layer" id="LR"><i class="dot"></i></div>
+</div>
+
+<script src="https://accounts.google.com/gsi/client" async defer></script>
+<script src="https://www.youtube.com/iframe_api"></script>
+<script type="module">
+import * as THREE from 'three';
+import {CSS3DRenderer,CSS3DObject} from 'three/addons/renderers/CSS3DRenderer.js';
+
+/* ====== AYARLAR (buranı dəyişib oynaya bilərsən) ====== */
+const CFG={
+ pano:'qis360.jpg', // mənzərə şəkli (index.html ilə eyni qovluqda)
+ tvDist:4,          // televizorun məsafəsi (böyüdükcə uzaqlaşır)
+ tvWidth:3.2,       // televizorun eni (böyüdükcə böyüyür)
+ tvHeight:0,        // televizorun hündürlüyü (0 = göz səviyyəsi)
+ ipd:0,             // 0 = iki göz tam eyni görüntü; 0.03-0.064 = dərinlik hissi (gözlər arasında kiçik fərq)
+ tvPx:Math.max(356,Math.round(854/(devicePixelRatio||1)))           // video keyfiyyəti: 854=480p (yüngül), 1280=720p (ağır)
+};
+
+const $=id=>document.getElementById(id);
+const canvas=$('gl');
+const renderer=new THREE.WebGLRenderer({canvas,antialias:true});
+renderer.setPixelRatio(Math.min(devicePixelRatio,2));
+renderer.outputColorSpace=THREE.SRGBColorSpace;
+
+/* ---- 360° mənzərə ---- */
+const scene=new THREE.Scene();
+scene.background=new THREE.Color(0xbfd3e6); // şəkil tapılmasa qış-mavi fon
+let panoMesh=null;
+function setPano(tex){
+ if(panoMesh){panoMesh.material.map.dispose();panoMesh.material.dispose();scene.remove(panoMesh)}
+ const geo=new THREE.SphereGeometry(50,64,48);geo.scale(-1,1,1);
+ panoMesh=new THREE.Mesh(geo,new THREE.MeshBasicMaterial({map:tex}));
+ scene.add(panoMesh);
+}
+let pvid=null; // tema videosu (varsa)
+function clearVid(){if(pvid){pvid.pause();pvid.removeAttribute('src');pvid.load();pvid=null}}
+function loadPano(url,done){
+ new THREE.TextureLoader().load(url,tex=>{
+  tex.colorSpace=THREE.SRGBColorSpace;tex.anisotropy=4;
+  clearVid();setPano(tex);done&&done();
+ },undefined,()=>console.warn('Mənzərə şəkli tapılmadı: '+url));
+}
+function loadVideoPano(url,done){ // 360° video tema (səssiz, dövrə ilə)
+ const v=document.createElement('video');
+ v.src=url;v.loop=true;v.muted=true;v.playsInline=true;v.setAttribute('playsinline','');
+ v.onloadeddata=()=>{
+  const tex=new THREE.VideoTexture(v);tex.colorSpace=THREE.SRGBColorSpace;
+  clearVid();setPano(tex);pvid=v;v.play().catch(()=>{});done&&done();
+ };
+ v.onerror=()=>alert('Tema videosu açılmadı');
+ v.load();
+}
+
+/* ---- İki göz üçün kamera ---- */
+const camL=new THREE.PerspectiveCamera(75,1,0.1,200);
+const camR=new THREE.PerspectiveCamera(75,1,0.1,200);
+
+/* ---- Televizor (hər göz üçün ayrı CSS3D) ---- */
+const cssL=new CSS3DRenderer(), cssR=new CSS3DRenderer();
+$('LL').appendChild(cssL.domElement);
+$('LR').appendChild(cssR.domElement);
+const sceneL=new THREE.Scene(), sceneR=new THREE.Scene();
+let k=CFG.tvWidth/CFG.tvPx;
+const holders={},tvObjs=[],tvEls={};
+function makeTV(scn,id){
+ const el=document.createElement('div');
+ el.style.cssText='width:'+CFG.tvPx+'px;height:'+Math.round(CFG.tvPx*9/16)+'px;background:#000';
+ const holder=document.createElement('div');holders[id]=holder;tvEls[id]=el;el.appendChild(holder);
+ const o=new CSS3DObject(el);
+ o.position.set(0,CFG.tvHeight,-CFG.tvDist);
+ o.scale.setScalar(k);
+ tvObjs.push(o);
+ scn.add(o);
+}
+makeTV(sceneL,'pL');makeTV(sceneR,'pR');
+
+/* ---- Ölçülər ---- */
+function resize(){
+ const w=innerWidth,h=innerHeight,hw=w/2;
+ renderer.setSize(w,h,false);
+ cssL.setSize(hw,h);cssR.setSize(hw,h);
+ camL.aspect=camR.aspect=hw/h;
+ camL.updateProjectionMatrix();camR.updateProjectionMatrix();
+}
+addEventListener('resize',resize);
+
+/* ---- Gyroscope (baş hərəkəti) ---- */
+const rad=d=>d*Math.PI/180;
+let gyro=null,needCenter=true;
+addEventListener('deviceorientation',e=>{
+ if(e.alpha==null)return;
+ gyro={a:rad(e.alpha),b:rad(e.beta),g:rad(e.gamma)};
+});
+const zee=new THREE.Vector3(0,0,1),euler=new THREE.Euler(),
+ q0=new THREE.Quaternion(),q1=new THREE.Quaternion(-Math.sqrt(.5),0,0,Math.sqrt(.5)),
+ q=new THREE.Quaternion(),off=new THREE.Quaternion(),fwd=new THREE.Vector3(),
+ Y=new THREE.Vector3(0,1,0),right=new THREE.Vector3(1,0,0);
+const sq=new THREE.Quaternion(),fw2=new THREE.Vector3();
+let sensorOK=false,chkN=0,chkBad=0;
+/* Maqnit sensoru olmayan (yalnız gyro+akselerometr) istiqamət sensoru: səs/maqnit yaw-ı sürüşdürməsin */
+function startSensor(){
+ try{
+  if(!('RelativeOrientationSensor' in window))return;
+  const sn=new RelativeOrientationSensor({frequency:60,referenceFrame:'screen'});
+  sn.addEventListener('reading',()=>{
+   const a=sn.quaternion;if(!a)return;
+   sq.set(a[0],a[1],a[2],a[3]);
+   if(!sensorOK&&chkN<90){sensorOK=true;needCenter=true;hasPrev=false}
+  });
+  sn.addEventListener('error',()=>{sensorOK=false;chkN=90});
+  sn.start();
+ }catch(e){}
+}
+function eulerQ(out){
+ const o=rad(screen.orientation?.angle||window.orientation||0);
+ euler.set(gyro.b,gyro.a,-gyro.g,'YXZ');
+ out.setFromEuler(euler);out.multiply(q1);out.multiply(q0.setFromAxisAngle(zee,-o));
+}
+const tq=new THREE.Quaternion(),tq2=new THREE.Quaternion(),prevBase=new THREE.Quaternion();let hasPrev=false;
+function updateOrientation(){
+ if(sensorOK||gyro)updateGyro();else q.identity();
+ applyView();
+}
+function updateGyro(){
+ if(sensorOK){
+  q.copy(q1).multiply(sq);
+  if(gyro&&chkN<90){ // ilk kadrlarda köhnə üsulla uyğunluğu yoxla; uyğun gəlmirsə köhnə üsula qayıt
+   eulerQ(tq2);
+   if(Math.abs(fwd.set(0,0,-1).applyQuaternion(q).y-fw2.set(0,0,-1).applyQuaternion(tq2).y)>0.35)chkBad++;
+   if(++chkN===90&&chkBad>30){sensorOK=false;needCenter=true;hasPrev=false}
+  }
+ }else eulerQ(q);
+ if(needCenter){ // baxdığın tərəf = televizorun olduğu tərəf
+  fwd.set(0,0,-1).applyQuaternion(q);
+  off.setFromAxisAngle(Y,-Math.atan2(-fwd.x,-fwd.z));
+  needCenter=false;
+ }
+ // sensor sıçrayışı (istinad sıfırlananda, məs. video açılanda): baş bir kadrda ~35°-dən çox dönə bilməz,
+ // belə fırlanmanı görünüşdən çıxarırıq ki, kamera arxaya çevrilməsin
+ tq.copy(off).multiply(q);
+ if(hasPrev&&tq.angleTo(prevBase)>0.6){off.copy(prevBase).multiply(tq2.copy(q).invert());tq.copy(off).multiply(q)}
+ prevBase.copy(tq);hasPrev=true;
+}
+const sm=new THREE.Quaternion();let smI=false;
+const fq=new THREE.Quaternion(),dq=new THREE.Quaternion(),pq=new THREE.Quaternion();
+let dragYaw=0,dragPitch=0;
+function applyView(){
+ fq.copy(off).multiply(q);
+ if(!smI){sm.copy(fq);smI=true}else sm.slerp(fq,0.5); // titrəməni azaldır
+ fq.copy(sm);
+ fq.premultiply(dq.setFromAxisAngle(Y,dragYaw));
+ fq.multiply(pq.setFromAxisAngle(right,dragPitch));
+ for(const c of [camL,camR])c.quaternion.copy(fq);
+ camL.position.copy(right).multiplyScalar(-CFG.ipd/2).applyQuaternion(fq);
+ camR.position.copy(right).multiplyScalar(CFG.ipd/2).applyQuaternion(fq);
+}
+/* Barmaqla sürüşdürərək də 360° baxmaq olur (gyroscope işləməsə də) */
+let last=null,moved=0,onTap=null;
+addEventListener('pointerdown',e=>{last=[e.clientX,e.clientY];moved=0});
+addEventListener('pointermove',e=>{
+ if(!last||touchH)return;
+ moved+=Math.abs(e.clientX-last[0])+Math.abs(e.clientY-last[1]);
+ dragYaw+=(e.clientX-last[0])*0.005;
+ dragPitch=Math.max(-1.2,Math.min(1.2,dragPitch+(e.clientY-last[1])*0.005));
+ last=[e.clientX,e.clientY];
+});
+addEventListener('pointerup',()=>{if(last&&moved<10&&onTap&&!touchH)onTap();last=null});
+
+/* ---- Render ---- */
+function loop(){
+ for(const e of [$('LL'),$('LR'),cssL.domElement,cssR.domElement]){if(e.scrollTop||e.scrollLeft){e.scrollTop=0;e.scrollLeft=0}}
+ if(window.scrollX||window.scrollY)window.scrollTo(0,0)
+ updateOrientation();
+ gazeUpdate();
+ const w=innerWidth,h=innerHeight,hw=w/2;
+ renderer.setScissorTest(true);
+ renderer.setViewport(0,0,hw,h);renderer.setScissor(0,0,hw,h);
+ renderer.render(scene,camL);
+ renderer.setViewport(hw,0,hw,h);renderer.setScissor(hw,0,hw,h);
+ renderer.render(scene,camR);
+ drawFrames();
+ cssL.render(sceneL,camL);cssR.render(sceneR,camR);
+}
+
+/* ---- YouTube ---- */
+let L,R,syncTimer=null,autoShort=false,shortsMode=null;
+function isShort(){return shortsMode!==null?shortsMode:autoShort}
+function startVideo(ID){
+ clearInterval(syncTimer);shortsMode=null;autoShort=false;ccOn=false;
+ for(const t of [600,1800,3500])setTimeout(()=>{if(!ccOn)for(const P of [L,R])try{P.unloadModule('captions')}catch(e){}},t); // altyazı avtomatik açılırsa bağla
+ const opts={width:String(CFG.tvPx),height:String(Math.round(CFG.tvPx*9/16))};
+ R=new YT.Player(holders.pR,{...opts,videoId:ID,
+  playerVars:{controls:0,playsinline:1,disablekb:1},
+  events:{onReady:e=>e.target.mute()}});
+ L=new YT.Player(holders.pL,{...opts,videoId:ID,playerVars:{playsinline:1,autoplay:1,rel:0,origin:location.origin},
+  events:{
+   onReady:e=>{e.target.setVolume(curVol);e.target.playVideo()},
+   onError:e=>alert('Video açılmadı (xəta '+e.data+'). Bəzi videolar yerləşdirməyə icazə vermir, başqa video sına.'),
+   onStateChange:e=>{
+    if(e.data===1){const du=L.getDuration();autoShort=du>0&&du<=60;shortsB.lastP=-1;
+     if(Math.abs(L.getCurrentTime()-R.getCurrentTime())>0.25)R.seekTo(L.getCurrentTime(),true);R.playVideo()}
+    if(e.data===2)R.pauseVideo();
+   }}});
+ /* Sinxron nəzarətçi: fərq böyüyəndə və ya biri donanda ikisi də dayanır,
+    eyni saniyəyə qayıdır və ikisi hazır olanda birlikdə davam edir */
+ let hold=false,stable=0,rate=1;
+ const setRate=r=>{if(rate!==r){rate=r;R.setPlaybackRate(r)}};
+ syncTimer=setInterval(()=>{
+  if(!L?.getPlayerState||!R?.getPlayerState)return;
+  const sl=L.getPlayerState(),sr=R.getPlayerState();
+  const buf=sl===3||sr===3;
+  if(hold){
+   if(buf){stable=0;return}
+   if(++stable<2)return;
+   hold=false;stable=0;
+   L.playVideo();R.playVideo();
+   return;
+  }
+  const d=R.getCurrentTime()-L.getCurrentTime(),ad=Math.abs(d);
+  if((sl===1||sr===1)&&(buf||(sl===1&&sr===1&&ad>0.5))){
+   // böyük fərq: ikisi də dayanıb eyni saniyədən birlikdə başlayır
+   setRate(1);hold=true;stable=0;
+   const t=L.getCurrentTime();
+   L.pauseVideo();R.pauseVideo();
+   L.seekTo(t,true);R.seekTo(t,true);
+  }else if(sl===1&&sr===1){
+   // kiçik fərq: atlama olmadan sağ video yüngülcə sürətlənir/yavaşlayır
+   if(ad>0.08)setRate(d>0?0.75:1.25);
+   else if(ad<0.03)setRate(1);
+  }else setRate(1);
+ },10);
+}
+
+/* ---- Birbaşa video (tək video, hər iki gözə eyni kadr = 0 ms fərq) ---- */
+let vid=null;const ctxs=[];
+function startFile(src){
+ vid=document.createElement('video');vid.volume=curVol/100;
+ vid.playsInline=true;vid.setAttribute('playsinline','');
+ vid.style.cssText='position:fixed;left:0;top:0;width:1px;height:1px;opacity:0;pointer-events:none';
+ document.body.appendChild(vid);
+ vid.onerror=()=>alert('Video açılmadı. Link birbaşa video faylı olmalıdır (.mp4, .webm, .m3u8) və sayt başqa saytlardan göstərməyə icazə verməlidir. Telefondan fayl seçmək hər zaman işləyir.');
+ if(/\.m3u8(\?|#|$)/i.test(src)&&!vid.canPlayType('application/vnd.apple.mpegurl')){
+  const sc=document.createElement('script');
+  sc.src='https://cdn.jsdelivr.net/npm/hls.js@1.5.13/dist/hls.min.js';
+  sc.onload=()=>{const h=new Hls();h.loadSource(src);h.attachMedia(vid);vid.play().catch(()=>{})};
+  sc.onerror=()=>alert('m3u8 oynadıcısı yüklənmədi');
+  document.head.appendChild(sc);
+ }else{vid.src=src;vid.play().catch(()=>{})}
+ for(const k of ['pL','pR']){
+  const c=document.createElement('canvas');
+  c.className='vc';c.width=1280;c.height=720;
+  holders[k].replaceWith(c);ctxs.push(c.getContext('2d'));
+ }
+ onTap=()=>{vid.paused?vid.play():vid.pause()};
+}
+function drawFrames(){
+ if(brz){drawBrowse();for(const c of bctx)c.drawImage(oc,0,0);return}
+ if(!vid||vid.readyState<2||!vid.videoWidth)return;
+ const W=1280,H=720,sc=Math.min(W/vid.videoWidth,H/vid.videoHeight),
+  dw=vid.videoWidth*sc,dh=vid.videoHeight*sc,dx=(W-dw)/2,dy=(H-dh)/2;
+ for(const c of ctxs){c.fillStyle='#000';c.fillRect(0,0,W,H);c.drawImage(vid,dx,dy,dw,dh)}
+}
+
+/* ---- Vimeo / Dailymotion (sinxron yoxdur, sağ göz səssizdir) ---- */
+function startEmbed(kind,id){
+ const base=kind==='vimeo'?'https://player.vimeo.com/video/'+id+'?autoplay=1'
+  :'https://www.dailymotion.com/embed/video/'+id+'?autoplay=1';
+ const mute=kind==='vimeo'?'&muted=1':'&mute=1';
+ [['pL',''],['pR',mute]].forEach(([k,m])=>{
+  const f=document.createElement('iframe');
+  f.src=base+m;f.style.cssText='width:100%;height:100%;border:0';
+  f.allow='autoplay; fullscreen; picture-in-picture';
+  holders[k].replaceWith(f);
+ });
+}
+
+/* ---- Tema yaddaşı (IndexedDB, brauzerdə daimi saxlanır) ---- */
+const idb=()=>new Promise((res,rej)=>{
+ const r=indexedDB.open('vrthemes',1);
+ r.onupgradeneeded=()=>r.result.createObjectStore('themes',{keyPath:'id',autoIncrement:true});
+ r.onsuccess=()=>res(r.result);r.onerror=()=>rej(r.error);
+});
+const tx=async(mode,fn)=>{
+ const db=await idb();
+ return new Promise((res,rej)=>{
+  const t=db.transaction('themes',mode);const out=fn(t.objectStore('themes'));
+  t.oncomplete=()=>res(out.result);t.onerror=()=>rej(t.error);
+ });
+};
+let themes=[],idx=+localStorage.getItem('themeIdx')||0,curUrl=null;
+
+function vthumb(file){ // videonun bir kadrından kiçik şəkil
+ return new Promise(res=>{
+  const v=document.createElement('video'),u=URL.createObjectURL(file);
+  const done=b=>{URL.revokeObjectURL(u);res(b)};
+  v.muted=true;v.playsInline=true;v.preload='auto';v.src=u;
+  v.onloadeddata=()=>{v.currentTime=Math.min(1,(v.duration||2)/2)};
+  v.onseeked=()=>{
+   const c=document.createElement('canvas');c.width=160;
+   c.height=Math.max(1,Math.round(160*v.videoHeight/v.videoWidth));
+   c.getContext('2d').drawImage(v,0,0,c.width,c.height);
+   c.toBlob(done,'image/jpeg',0.7);
+  };
+  v.onerror=()=>done(null);
+  setTimeout(()=>done(null),8000);
+ });
+}
+async function shrink(file){ // şəkli max 4096 px-ə kiçildir (yaddaş + telefon üçün)
+ try{
+  const bmp=await createImageBitmap(file);
+  const mk=(w,h,q)=>{const c=document.createElement('canvas');c.width=w;c.height=h;
+   c.getContext('2d').drawImage(bmp,0,0,w,h);return new Promise(r=>c.toBlob(r,'image/jpeg',q))};
+  const sc=Math.min(1,4096/bmp.width);
+  const blob=await mk(Math.round(bmp.width*sc),Math.round(bmp.height*sc),0.9);
+  const thumb=await mk(160,Math.max(1,Math.round(160*bmp.height/bmp.width)),0.7);
+  bmp.close?.();
+  return {blob,thumb};
+ }catch(e){return {blob:file,thumb:file}}
+}
+async function refresh(){
+ try{themes=await tx('readonly',st=>st.getAll())}catch(e){themes=[]}
+ const box=$('tlist');box.innerHTML='';
+ themes.forEach(t=>{
+  const d=document.createElement('div');d.className='th';
+  const im=document.createElement('img');
+  if(t.thumb){im.src=URL.createObjectURL(t.thumb);im.onload=()=>URL.revokeObjectURL(im.src)}else im.style.background='#444';
+  const x=document.createElement('button');x.textContent='✕';
+  x.onclick=async()=>{await tx('readwrite',st=>st.delete(t.id));refresh()};
+  d.append(im,x);
+  if(t.type==='video'){const bd2=document.createElement('span');bd2.textContent='🎞';d.append(bd2)}
+  box.appendChild(d);
+ });
+}
+$('tfile').onchange=async e=>{
+ const files=[...e.target.files];
+ for(let i=0;i<files.length;i++){
+  $('tb').textContent='⏳ '+(i+1)+'/'+files.length;
+  const isV=files[i].type.startsWith('video/');
+  const {blob,thumb}=isV?{blob:files[i],thumb:await vthumb(files[i])}:await shrink(files[i]);
+  try{await tx('readwrite',st=>st.add({name:files[i].name,blob,thumb,type:isV?'video':'image'}))}
+  catch(err){alert('Yaddaşa yazmaq alınmadı: '+err)}
+ }
+ e.target.value='';$('tb').textContent='🖼 +';
+ navigator.storage?.persist?.();
+ refresh();
+};
+refresh();
+
+function showTheme(i){
+ if(!themes.length){loadPano(CFG.pano);return}
+ idx=((i%themes.length)+themes.length)%themes.length;
+ try{localStorage.setItem('themeIdx',idx)}catch(e){}
+ const t=themes[idx],u=URL.createObjectURL(t.blob);
+ (t.type==='video'?loadVideoPano:loadPano)(u,()=>{if(curUrl)URL.revokeObjectURL(curUrl);curUrl=u});
+ themeB.lastP=-1;
+}
+
+/* ---- Tema düyməsi (2 saniyə baxanda işləyir) ---- */
+function mkBtn(icon,radius,dwell,fire){
+ const c=document.createElement('canvas');c.width=c.height=256;
+ const tex=new THREE.CanvasTexture(c);tex.colorSpace=THREE.SRGBColorSpace;
+ const m=new THREE.Mesh(new THREE.PlaneGeometry(0.45,0.45),
+  new THREE.MeshBasicMaterial({map:tex,transparent:true,depthTest:false}));
+ m.renderOrder=10;scene.add(m);
+ const b={m,t:0,lastP:-1,locked:false,radius,dwell,fire};
+ b.redraw=p=>{
+  const x=c.getContext('2d');x.clearRect(0,0,256,256);
+  x.fillStyle='rgba(0,0,0,.5)';x.beginPath();x.arc(128,128,112,0,7);x.fill();
+  x.lineWidth=14;x.lineCap='round';x.lineJoin='round';
+  x.strokeStyle='rgba(255,255,255,.35)';x.beginPath();x.arc(128,128,112,0,7);x.stroke();
+  if(p>0){x.strokeStyle='#4fc3f7';x.beginPath();
+   x.arc(128,128,112,-Math.PI/2,-Math.PI/2+p*2*Math.PI);x.stroke()}
+  x.strokeStyle='#fff';x.fillStyle='#fff';
+  icon(x);tex.needsUpdate=true;
+ };
+ return b;
+}
+const themeB=mkBtn(x=>{
+ x.lineWidth=16;x.beginPath();
+ x.moveTo(88,78);x.lineTo(128,118);x.lineTo(88,158);
+ x.moveTo(128,78);x.lineTo(168,118);x.lineTo(128,158);x.stroke();
+ x.font='bold 36px sans-serif';x.textAlign='center';
+ x.fillText((idx+1)+'/'+themes.length,128,212);
+},0.1,2,()=>showTheme(idx+1));
+
+function togglePlay(){
+ if(vid){vid.paused?vid.play():vid.pause();return}
+ if(L?.getPlayerState)L.getPlayerState()===1?L.pauseVideo():L.playVideo();
+}
+const playB=mkBtn(x=>{x.lineWidth=26;x.beginPath();
+ x.moveTo(98,80);x.lineTo(98,176);x.moveTo(158,80);x.lineTo(158,176);x.stroke()},0.07,1,togglePlay);
+
+const gl=g=>x=>{x.font='bold 120px sans-serif';x.textAlign='center';x.textBaseline='middle';x.fillText(g,128,134)};
+function seek(d){
+ if(vid){vid.currentTime=Math.max(0,vid.currentTime+d);return}
+ if(L?.getCurrentTime)L.seekTo(Math.max(0,L.getCurrentTime()+d),true);
+}
+function vol(d){
+ if(vid){vid.volume=Math.min(1,Math.max(0,vid.volume+d/100));return}
+ if(L?.getVolume)L.setVolume(Math.min(100,Math.max(0,L.getVolume()+d)));
+}
+const prevB=mkBtn(gl('⏮'),0.07,1,()=>step(-1)),backB=mkBtn(gl('⏪'),0.07,1,()=>seek(-10)),
+ fwdB=mkBtn(gl('⏩'),0.07,1,()=>seek(10)),nextB=mkBtn(gl('⏭'),0.07,1,()=>step(1));
+const searchB=mkBtn(x=>{x.lineWidth=18;x.beginPath();x.arc(118,118,40,0,7);
+ x.moveTo(148,148);x.lineTo(184,184);x.stroke()},0.07,1,()=>backToSearch());
+const shortsB=mkBtn(x=>{const on=isShort();x.fillStyle=on?'#4fc3f7':'#fff';
+ x.font='bold 110px sans-serif';x.textAlign='center';x.textBaseline='middle';x.fillText('↕',128,112);
+ x.font='bold 44px sans-serif';x.fillText(on?'ON':'OFF',128,196)},0.07,1,()=>{shortsMode=!isShort();shortsB.lastP=-1});
+let ccOn=false;
+function setCC(on){ // altyazı (YouTube-un qeyri-rəsmi modulu, hər video üçün işləməyə bilər)
+ ccOn=on;
+ for(const P of [L,R]){try{
+  if(on){
+   P.loadModule('captions');
+   setTimeout(()=>{try{
+    const tl=P.getOption('captions','tracklist')||[],lang=REGS[regIdx].l||'en';
+    const t=tl.find(x=>x.languageCode===lang)||tl[0];
+    if(t)P.setOption('captions','track',t.languageCode===lang?{languageCode:lang}:{languageCode:t.languageCode,translationLanguage:{languageCode:lang}});
+   }catch(e){}},900);
+  }else P.unloadModule('captions');
+ }catch(e){}}
+}
+const ccB=mkBtn(x=>{x.fillStyle=ccOn?'#4fc3f7':'#fff';x.font='bold 110px sans-serif';
+ x.textAlign='center';x.textBaseline='middle';x.fillText('CC',128,128)},0.07,1,()=>{setCC(!ccOn);ccB.lastP=-1});
+const RES=[854,1280,1920],RESN={854:'480',1280:'720',1920:'1080'};
+let resIdx=0; // hədəf piksel eni; CSS ölçüsü ekranın piksel sıxlığına bölünür
+function cycleRes(){ // keyfiyyət: YouTube keyfiyyəti oynadıcının ölçüsünə görə seçir
+ resIdx=(resIdx+1)%RES.length;CFG.tvPx=Math.max(356,Math.round(RES[resIdx]/(devicePixelRatio||1)));k=CFG.tvWidth/CFG.tvPx;
+ const w=CFG.tvPx,h=Math.round(w*9/16);
+ for(const key of ['pL','pR']){const el=tvEls[key];el.style.width=w+'px';el.style.height=h+'px'}
+ const q=RES[resIdx]>=1900?'hd1080':RES[resIdx]>=1200?'hd720':'large';
+ try{L?.setSize(w,h);R?.setSize(w,h);L?.setPlaybackQuality(q);R?.setPlaybackQuality(q)}catch(e){}
+ applyZoom();hdB.lastP=-1;
+}
+const hdB=mkBtn(x=>{x.font='bold 84px sans-serif';x.textAlign='center';x.textBaseline='middle';
+ x.fillText(RESN[RES[resIdx]],128,110);x.font='bold 50px sans-serif';x.fillText('p',128,194)},0.07,1,cycleRes);
+const ctrlBtns=[prevB,backB,playB,fwdB,nextB,shortsB,ccB,hdB,searchB];
+
+/* ---- Səs zolağı (videonun solunda): 2 san baxıb tut, başı yuxarı/aşağı əy, 1 san saxla = burax ---- */
+let curVol=100,BARH=1,volLast=-9,volLastP=-1,volState=0;
+const volC=document.createElement('canvas');volC.width=128;volC.height=512;
+const volTex=new THREE.CanvasTexture(volC);volTex.colorSpace=THREE.SRGBColorSpace;
+const volM=new THREE.Mesh(new THREE.PlaneGeometry(0.2,1),
+ new THREE.MeshBasicMaterial({map:volTex,transparent:true,depthTest:false}));
+volM.renderOrder=10;scene.add(volM);
+function drawVol(p,grabbed){
+ const x=volC.getContext('2d');x.clearRect(0,0,128,512);
+ x.fillStyle='rgba(0,0,0,.55)';x.beginPath();x.roundRect(24,10,80,492,40);x.fill();
+ x.save();x.beginPath();x.roundRect(24,10,80,492,40);x.clip();
+ x.fillStyle=grabbed?'#4fc3f7':'rgba(255,255,255,.85)';
+ const h=492*curVol/100;x.fillRect(24,502-h,80,h);x.restore();
+ x.lineWidth=8;x.strokeStyle=grabbed?'#4fc3f7':'rgba(255,255,255,.4)';
+ x.beginPath();x.roundRect(24,10,80,492,40);x.stroke();
+ if(p>0){x.strokeStyle='#4fc3f7';x.lineWidth=10;x.setLineDash([p*1200,3000]);
+  x.beginPath();x.roundRect(20,6,88,500,44);x.stroke();x.setLineDash([])}
+ x.font='bold 34px sans-serif';x.textAlign='center';x.lineWidth=6;x.strokeStyle='#000';
+ x.strokeText(Math.round(curVol),64,62);x.fillStyle='#fff';x.fillText(Math.round(curVol),64,62);
+ volTex.needsUpdate=true;
+}
+function getVol(){try{if(vid)return vid.volume*100;if(L?.getVolume)return L.getVolume()}catch(e){}return curVol}
+function setVol(v){
+ curVol=Math.min(100,Math.max(0,v));
+ try{if(vid)vid.volume=curVol/100;else if(L?.setVolume)L.setVolume(curVol)}catch(e){}
+}
+let vHover=0,vgrab=null,vLocked=false;
+
+/* ---- Vaxt zolağı (videonun altında): istədiyin yerə 1 saniyə bax = oraya keç ---- */
+const seekC=document.createElement('canvas');seekC.width=1280;seekC.height=64;
+const seekTex=new THREE.CanvasTexture(seekC);seekTex.colorSpace=THREE.SRGBColorSpace;
+const seekM=new THREE.Mesh(new THREE.PlaneGeometry(1,1),
+ new THREE.MeshBasicMaterial({map:seekTex,transparent:true,depthTest:false}));
+seekM.renderOrder=10;scene.add(seekM);
+let sHover=0,sx0=0,sLast=-9,seekKey='';
+function vtime(){try{if(vid)return [vid.currentTime,vid.duration||0];if(L?.getCurrentTime)return [L.getCurrentTime(),L.getDuration()||0]}catch(e){}return [0,0]}
+function seekAbs(t){try{if(vid)vid.currentTime=t;else L?.seekTo(t,true)}catch(e){}}
+function drawSeek(fr,hx,hp){
+ const x=seekC.getContext('2d');x.clearRect(0,0,1280,64);
+ x.fillStyle='rgba(0,0,0,.55)';x.beginPath();x.roundRect(0,18,1280,28,14);x.fill();
+ x.fillStyle='#ff4040';x.beginPath();x.roundRect(0,18,Math.max(28,1280*fr),28,14);x.fill();
+ if(hx>=0){x.fillStyle='#4fc3f7';x.fillRect(hx-3,4,6,56);x.strokeStyle='#4fc3f7';x.lineWidth=6;
+  x.beginPath();x.arc(hx,32,8+hp*20,0,7);x.stroke()}
+ seekTex.needsUpdate=true;
+}
+
+/* ---- Video ölçüsü: kənarlara 1 saniyə baxıb tutmaq ---- */
+let zoom=+localStorage.getItem('tvZoom')||1,zt=null;
+const frame=[]; // yalnız baxanda görünən nazik çərçivə
+for(let i=0;i<4;i++){
+ const m=new THREE.Mesh(new THREE.PlaneGeometry(1,1),
+  new THREE.MeshBasicMaterial({color:0x4fc3f7,transparent:true,opacity:0,depthTest:false}));
+ m.renderOrder=9;m.visible=false;scene.add(m);frame.push(m);
+}
+function setFrame(op){for(const m of frame){m.visible=op>0.01;m.material.opacity=op}}
+function applyZoom(){
+ zoom=Math.min(2.5,Math.max(0.4,zoom));
+ for(const o of tvObjs)o.scale.setScalar(k*zoom);
+ const W2=CFG.tvWidth*zoom/2,H2=W2*9/16,y0=CFG.tvHeight,T=0.05,G=0.02,z=-CFG.tvDist;
+ frame[0].position.set(0,y0+H2+G+T/2,z);frame[0].scale.set(2*W2+2*(G+T),T,1);
+ frame[1].position.set(0,y0-H2-G-T/2,z);frame[1].scale.set(2*W2+2*(G+T),T,1);
+ frame[2].position.set(-(W2+G+T/2),y0,z);frame[2].scale.set(T,2*H2+2*G,1);
+ frame[3].position.set(W2+G+T/2,y0,z);frame[3].scale.set(T,2*H2+2*G,1);
+ themeB.m.position.set(-(W2+0.95),y0,z);
+ ctrlBtns.forEach((b,i)=>b.m.position.set((i-4)*0.62,y0-H2-0.75,z));
+ seekM.position.set(0,y0-H2-0.27,z);seekM.scale.set(2*W2,0.16,1);seekKey='';
+ volM.position.set(-(W2+0.3),y0,z);BARH=Math.min(1.4,Math.max(0.6,H2*1.6));volM.scale.set(1,BARH,1);volLast=-9;
+ clearTimeout(zt);
+ zt=setTimeout(()=>{try{localStorage.setItem('tvZoom',zoom)}catch(e){}},400);
+}
+// nöqtə videonun kənarına yaxındırmı? (kənarın bir az içi və xarici zolaq)
+function edgeAt(px,py){
+ const W2=CFG.tvWidth*zoom/2,H2=W2*9/16;
+ const nx=px/W2,ny=(py-CFG.tvHeight)/H2;
+ const m=Math.max(Math.abs(nx),Math.abs(ny));
+ if(m<0.95||m>1.45)return null;
+ const sx=Math.abs(nx)>0.7?Math.sign(nx):0,sy=Math.abs(ny)>0.7?Math.sign(ny):0;
+ if(!sx&&!sy)return null;
+ return {sx,sy,W2,H2};
+}
+// mərkəzdən məsafə (tutulan kənara/künca görə)
+function edgeDist(e,px,py){
+ const a=Math.abs(px)/e.W2,b=Math.abs(py-CFG.tvHeight)/e.H2;
+ return e.sx&&e.sy?Math.max(a,b):e.sx?a:b;
+}
+applyZoom();
+
+/* Barmaqla (telefon ekranında) da eyni qaydada */
+let touchH=null;
+const ray=new THREE.Raycaster(),ndc=new THREE.Vector2();
+function rayPoint(ev){
+ const hw=innerWidth/2,left=ev.clientX<hw,lx=left?ev.clientX:ev.clientX-hw;
+ ndc.set(lx/hw*2-1,-(ev.clientY/innerHeight)*2+1);
+ ray.setFromCamera(ndc,left?camL:camR);
+ const o=ray.ray.origin,d=ray.ray.direction;
+ if(d.z>-0.05)return null;
+ const t=(-CFG.tvDist-o.z)/d.z;
+ return {x:o.x+d.x*t,y:o.y+d.y*t};
+}
+addEventListener('pointerdown',ev=>{
+ touchH=null;
+ if($('eyes').style.display!=='block')return;
+ const pt=rayPoint(ev),ed=pt&&edgeAt(pt.x,pt.y);
+ if(ed){
+  touchH={e:ed,d0:edgeDist(ed,pt.x,pt.y),z0:zoom};
+  try{document.documentElement.setPointerCapture(ev.pointerId)}catch(err){}
+ }
+});
+addEventListener('pointermove',ev=>{
+ if(!touchH)return;
+ const pt=rayPoint(ev);if(!pt)return;
+ zoom=touchH.z0*edgeDist(touchH.e,pt.x,pt.y)/touchH.d0;applyZoom();
+});
+addEventListener('pointerup',()=>{touchH=null});
+
+// baxış nöqtəsi (kiçik ağ nöqtə, hər göz üçün ayrı)
+const dotGeo=new THREE.CircleGeometry(0.012,16);
+const dotMat=new THREE.MeshBasicMaterial({color:0xffffff,transparent:true,opacity:.85,depthTest:false});
+const dL=new THREE.Mesh(dotGeo,dotMat),dR=new THREE.Mesh(dotGeo,dotMat);
+dL.renderOrder=dR.renderOrder=20;dL.layers.set(1);dR.layers.set(2);
+camL.layers.enable(1);camR.layers.enable(2);
+scene.add(dL,dR);dL.visible=dR.visible=false;
+
+/* ---- Baxışla idarə: tema düyməsi + video kənarını tutub çəkmək ---- */
+const HOVER_DWELL=1; // kənara neçə saniyə baxanda tutulur
+const SWIPE_DIST=0.9,SWIPE_TIME=0.5; // sürüşdürmə: nöqtə bu məsafəni (≈10°) bu müddətdə keçsin
+const gh=[];let swipeCool=0;
+function swipe(d){if(brz)scrollY+=d*285;else step(d)} // yalnız yuxarı çəkmə: növbəti video / siyahı aşağı
+let lastT=performance.now(),hoverT=0,grab=null,gLocked=false,
+ ref={x:0,y:0},stillT=0,movedFar=false,gx=0,gy=0;
+const fw=new THREE.Vector3(),bd=new THREE.Vector3();
+function gazeUpdate(){
+ const now=performance.now(),dt=Math.min((now-lastT)/1000,0.1);lastT=now;
+ fw.set(0,0,-1).applyQuaternion(fq);
+ for(const [d,c] of [[dL,camL],[dR,camR]]){
+  d.position.copy(c.position).addScaledVector(fw,1);d.quaternion.copy(fq);
+ }
+ const hasPt=fw.z<-0.05;
+ if(hasPt){const t=CFG.tvDist/-fw.z;gx=fw.x*t;gy=fw.y*t}
+ // səs zolağı
+ volM.visible=!brz;
+ let onBar=false;
+ if(volM.visible&&hasPt)onBar=Math.abs(gx-volM.position.x)<0.15&&Math.abs(gy-volM.position.y)<BARH/2+0.1;
+ if(vgrab){
+  onBar=true;
+  if(hasPt){
+   setVol(vgrab.v0+(gy-vgrab.y0)/BARH*100);
+   if(Math.hypot(gx-vgrab.rx,gy-vgrab.ry)>0.12){vgrab.rx=gx;vgrab.ry=gy;vgrab.still=0;vgrab.moved=true}
+   else vgrab.still+=dt;
+   if(vgrab.still>(vgrab.moved?1:3)){vgrab=null;vLocked=true;gh.length=0;navigator.vibrate?.([20,40,20])}
+  }
+ }else if(onBar&&!vLocked){
+  vHover+=dt;
+  if(vHover>=2){vgrab={y0:gy,v0:getVol(),rx:gx,ry:gy,still:0,moved:false};vHover=0;gh.length=0;navigator.vibrate?.(40)}
+ }else{vHover=0;if(!onBar)vLocked=false}
+ {const vp=vgrab?0:Math.min(vHover/2,1),vs=vgrab?2:0;
+  if(Math.abs(vp-volLastP)>0.01||Math.round(curVol)!==volLast||vs!==volState){
+   drawVol(vp,!!vgrab);volLastP=vp;volLast=Math.round(curVol);volState=vs}}
+ // vaxt zolağı
+ seekM.visible=!brz&&!!(vid||L);
+ let onSeek=false;
+ if(seekM.visible&&hasPt){
+  const W2=CFG.tvWidth*zoom/2;
+  onSeek=Math.abs(gx)<W2+0.05&&Math.abs(gy-seekM.position.y)<0.1;
+  if(onSeek&&!vgrab){
+   if(Math.abs(gx-sx0)>0.2){sx0=gx;sHover=0}
+   if(Math.abs(gx-sLast)>0.3){
+    sHover+=dt;
+    if(sHover>=1){const d=vtime()[1];if(d>0)seekAbs(Math.min(1,Math.max(0,(gx+W2)/(2*W2)))*d);sLast=gx;sHover=0;navigator.vibrate?.(30)}
+   }
+  }else{sHover=0;if(!onSeek)sLast=-9}
+  const [t,d]=vtime(),fr=d?t/d:0,hx=onSeek?(gx+W2)/(2*W2)*1280:-1,key=Math.round(fr*500)+'|'+Math.round(hx/8)+'|'+Math.round(sHover*20);
+  if(key!==seekKey){seekKey=key;drawSeek(fr,hx,Math.min(sHover,1))}
+ }
+ if(brz&&hasPt){const W=CFG.tvWidth*zoom;browseGaze((gx/W+0.5)*1280,(0.5-(gy-CFG.tvHeight)/(W*9/16))*720,dt)}
+ if(hasPt&&!onBar&&!onSeek&&(brz||isShort())){ // yalnız Shorts-da (və nəticə siyahısında): nöqtəni aşağıdan yuxarı tez çəkmək
+  gh.push({t:now,x:gx,y:gy});
+  while(gh.length&&now-gh[0].t>SWIPE_TIME*1000)gh.shift();
+  if(now>swipeCool&&!grab&&!touchH&&gh.length>3){
+   const o=gh[0],dy=gy-o.y,dx=gx-o.x,W2=CFG.tvWidth*zoom/2,H2=W2*9/16;
+   if(dy>SWIPE_DIST&&Math.abs(dx)<dy*0.6&&
+    Math.abs(o.x)<W2*1.1&&Math.abs(o.y-CFG.tvHeight)<H2*1.1){
+    swipeCool=now+1200;gh.length=0;navigator.vibrate?.(30);
+    swipe(1);
+   }
+  }
+ }
+
+ // tema düyməsi
+ themeB.m.visible=themes.length>1;
+ for(const b of ctrlBtns)b.m.visible=!brz;
+ let best=null,ba=9;
+ for(const b of [themeB,...ctrlBtns]){
+  if(!b.m.visible)continue;
+  bd.copy(b.m.position).normalize();
+  const a=fw.angleTo(bd);if(a<b.radius&&a<ba){ba=a;best=b}
+ }
+ for(const b of [themeB,...ctrlBtns]){
+  if(!b.m.visible)continue;
+  const on=b===best;
+  if(on&&!b.locked){
+   b.t=Math.min(b.t+dt,b.dwell);
+   if(b.t>=b.dwell){b.t=0;b.locked=true;navigator.vibrate?.(20);b.fire()}
+  }else{
+   if(!on)b.locked=false;
+   b.t=Math.max(0,b.t-dt*2);
+  }
+  const p=Math.min(b.t/b.dwell,1);
+  if(Math.abs(p-b.lastP)>0.01){b.redraw(p);b.lastP=p}
+ }
+
+ // video kənarı
+ if(touchH){setFrame(1);return}
+ if(grab){
+  if(hasPt){
+   const target=grab.z0*edgeDist(grab.e,gx,gy)/grab.d0;
+   zoom+=(target-zoom)*Math.min(1,dt*10);applyZoom();
+   if(Math.hypot(gx-ref.x,gy-ref.y)>0.3){ref={x:gx,y:gy};stillT=0;movedFar=true}
+   else stillT+=dt;
+   const rel=movedFar?0.8:3; // başı bu qədər saniyə saxlayanda buraxılır
+   if(stillT>rel){grab=null;gLocked=true;setFrame(0);navigator.vibrate?.([20,40,20])}
+   else setFrame(1-0.6*Math.min(stillT/rel,1)); // buraxılmağa yaxınlaşdıqca çərçivə solur
+  }
+  return;
+ }
+ const onBtn=[themeB,...ctrlBtns].some(b=>b.m.visible&&fw.angleTo(bd.copy(b.m.position).normalize())<b.radius*1.3);
+ const near=hasPt&&!onBtn&&!onBar&&!onSeek?edgeAt(gx,gy):null;
+ if(gLocked&&!near)gLocked=false;
+ if(near&&!gLocked){
+  hoverT+=dt;
+  if(hoverT>=HOVER_DWELL){
+   grab={e:near,d0:edgeDist(near,gx,gy),z0:zoom};
+   hoverT=0;ref={x:gx,y:gy};stillT=0;movedFar=false;navigator.vibrate?.(40);
+  }
+ }else hoverT=0;
+ setFrame(grab?1:Math.min(hoverT/HOVER_DWELL,1)*0.7);
+}
+
+/* ---- Bluetooth pult / klaviatura ---- */
+addEventListener('keydown',ev=>{
+ if($('eyes').style.display!=='block')return;
+ const key=ev.key;
+ if(key===' '||key==='Enter'||key==='MediaPlayPause'){togglePlay();ev.preventDefault()}
+ else if(key==='ArrowRight'||key==='MediaTrackNext')showTheme(idx+1);
+ else if(key==='ArrowLeft'||key==='MediaTrackPrevious')showTheme(idx-1);
+ else if(key==='ArrowUp'){zoom*=1.1;applyZoom()}
+ else if(key==='ArrowDown'){zoom/=1.1;applyZoom()}
+ else if(key==='Escape'||key==='Backspace')backToSearch();
+});
+
+/* ---- YouTube axtarış ekranı (ekranın içində, baxışla idarə) ---- */
+const YT_KEY='AIzaSyD4Q6BofTbKU2C0kfPJR7tB7zyA1jyYFzI';
+/* Shorts lenti üçün ölkə/dil seçimi (🌐 düyməsi) */
+const RC=((navigator.language||'').split('-')[1]||'US').toUpperCase(),LANGC=(navigator.language||'az').slice(0,2);
+const REGS=[{n:'',r:RC,l:LANGC}];let regIdx=0;
+/* İzləmə yaddaşı (yalnız bu telefonda): 8 saniyədən çox baxılan videolar */
+let hist=[],histT=null,curId='',feedQ='#shorts',sugs=[],lastSugQ='',sugT=null,homeCache=null;
+try{hist=JSON.parse(localStorage.getItem('ytHist')||'[]')}catch(e){}
+function seedQuery(){ // son izlənənlərin başlıqlarından ən çox təkrarlanan sözlər
+ const cnt={};
+ for(const h of hist.slice(-8))
+  for(const w of h.t.toLowerCase().replace(/#[\p{L}\p{N}_]+/gu,' ').split(/[^\p{L}\p{N}]+/u))
+   if(w.length>=4)cnt[w]=(cnt[w]||0)+1;
+ const top=Object.entries(cnt).sort((a,b)=>b[1]-a[1]).slice(0,2).map(e=>e[0]);
+ return '#shorts'+(hist.length>=3&&top.length?' '+top.join(' '):'');
+}
+let brz=false,query='',results=[],scrollY=0,curIdx=0,nextTok='',loading=false,feed=false,kbOpen=false,hits=[],bhover=null,bT=0,bLock=false,msg='';
+const oc=document.createElement('canvas');oc.width=1280;oc.height=720;
+const bx=oc.getContext('2d'),bctx=[],imgs={};
+const KEYS=['qüertyuiopöğ','asdfghjklıə','zxcvbnmçş'];
+const img=u=>imgs[u]||(imgs[u]=Object.assign(new Image(),{src:u}));
+function decode(t){const e=document.createElement('textarea');e.innerHTML=t;return e.value}
+async function doSearch(more){
+ if(more!==true){if(!query.trim())return;kbOpen=false;msg='...';results=[];scrollY=0;nextTok='';feed=false;recordSearch(query)}
+ if(loading)return;loading=true;
+ try{
+  const r=await fetch('https://www.googleapis.com/youtube/v3/search?part=snippet&type=video&videoEmbeddable=true&maxResults=24&q='+encodeURIComponent(query)+(more===true&&nextTok?'&pageToken='+nextTok:'')+'&key='+YT_KEY);
+  const j=await r.json();
+  if(j.error){msg='Xəta: '+j.error.message.slice(0,70)}
+  else{
+   nextTok=j.nextPageToken||'';
+   const add=j.items.map(it=>({id:it.id.videoId,title:decode(it.snippet.title),th:it.snippet.thumbnails.medium.url}));
+   results=more===true?results.concat(add):add;
+   msg=results.length?'':'Nəticə yoxdur';
+  }
+ }catch(e){msg='İnternet xətası'}
+ loading=false;
+}
+function fetchSug(q){ // axtarış təklifləri (YouTube-un öz təklif xidməti, qeyri-rəsmi)
+ if(!q.trim()){sugs=[];return}
+ const cb='__sug'+Date.now(),sc=document.createElement('script');
+ const done=()=>{delete window[cb];sc.remove()};
+ window[cb]=d=>{if(q===query)sugs=(d[1]||[]).map(x=>Array.isArray(x)?x[0]:x).slice(0,4);done()};
+ sc.onerror=done;
+ sc.src='https://suggestqueries.google.com/complete/search?client=youtube&ds=yt&q='+encodeURIComponent(q)+'&jsonp='+cb;
+ document.head.appendChild(sc);
+}
+let sHist=[],shQueue=[];
+try{sHist=JSON.parse(localStorage.getItem('ytSearches')||'[]')}catch(e){}
+try{shQueue=JSON.parse(localStorage.getItem('ytShorts')||'[]')}catch(e){}
+const saveQueue=()=>{try{localStorage.setItem('ytShorts',JSON.stringify(shQueue.slice(0,150)))}catch(e){}};
+function recordSearch(q){
+ q=q.trim();if(!q)return;
+ sHist=sHist.concat(q).slice(-60);
+ try{localStorage.setItem('ytSearches',JSON.stringify(sHist))}catch(e){}
+}
+function topQueries(n){ // axtarışlardan ən çox və ən yeni n fərqli sorğu
+ const sc=new Map();
+ sHist.forEach((q,i)=>{const k=q.toLowerCase(),o=sc.get(k)||{q,s:0};o.q=q;o.s+=i+1;sc.set(k,o)});
+ return [...sc.values()].sort((a,b)=>b.s-a.s).slice(0,n).map(o=>o.q);
+}
+function topWords(list,n){ // izlənən videoların başlıqlarından fərqli mövzuları ayırır
+ const L=list.slice(-12),cnt={};
+ const sets=L.map(h=>new Set(h.t.toLowerCase().replace(/#[\p{L}\p{N}_]+/gu,' ').split(/[^\p{L}\p{N}]+/u).filter(w=>w.length>=4)));
+ sets.forEach((st,i)=>st.forEach(w=>cnt[w]=(cnt[w]||0)+i+1));
+ const out=[];
+ for(const [w] of Object.entries(cnt).sort((a,b)=>b[1]-a[1])){
+  if(out.length>=n)break;
+  if(!out.some(o=>sets.some(st=>st.has(o)&&st.has(w))))out.push(w);
+ }
+ return out;
+}
+const CATS=[10,20,17,24,23,25,28,22,26,27,1,2];
+async function loadHome(force){ // ana səhifə: axtarışlar + izlənən uzun videolar; yaddaşda saxlanır
+ if(loading)return;
+ if(!homeCache){try{homeCache=JSON.parse(localStorage.getItem('ytHome')||'null')}catch(e){}}
+ const longN=hist.filter(h=>!h.s).length,key=sHist.length+'-'+longN+'-'+(gTok?subFeed.length+1:0),old=homeCache;
+ scrollY=0;nextTok='';feed=false;kbOpen=false;
+ if(!force&&old&&old.list&&old.list.length&&old.k===key&&Date.now()-old.t<432e5){results=old.list;msg='';return}
+ loading=true;msg='...';results=[];
+ try{
+  const R=REGS[regIdx],seen=new Set(hist.map(h=>h.id)),ids=new Set();
+  const base='https://www.googleapis.com/youtube/v3/';
+  const J=async u=>{try{return await (await fetch(u+'&key='+YT_KEY)).json()}catch(e){return {}}};
+  const mk=(id,sn)=>({id,title:decode(sn.title),th:sn.thumbnails.medium.url});
+  const qs=[...new Set([...topQueries(2),...topWords(hist.filter(h=>!h.s).concat(likedT),2)])].slice(0,4);
+  const pers=await Promise.all(qs.map(q=>J(base+'search?part=snippet&type=video&videoEmbeddable=true&maxResults=10&q='+encodeURIComponent(q))));
+  const P=pers.map(j=>(j.items||[]).map(it=>mk(it.id.videoId,it.snippet)));
+  const cs=[...CATS].sort(()=>Math.random()-.5).slice(0,2);
+  const cats=await Promise.all(cs.map(c=>J(base+'videos?part=snippet,status&chart=mostPopular&maxResults=10&videoCategoryId='+c+'&regionCode='+R.r)));
+  const C=cats.map(j=>(j.items||[]).filter(v=>v.status&&v.status.embeddable).map(v=>mk(v.id,v.snippet)));
+  const tr=await J(base+'videos?part=snippet,status&chart=mostPopular&maxResults=20&regionCode='+R.r);
+  const T=(tr.items||[]).filter(v=>v.status&&v.status.embeddable).map(v=>mk(v.id,v.snippet));
+  const lists=[...(subFeed.length?[subFeed.slice()]:[]),...P,...C,T],list=[];
+  while(lists.some(a=>a.length)){ // hər mənbədən növbə ilə bir video
+   for(const a of lists){
+    while(a.length){const v=a.shift();if(!ids.has(v.id)&&!seen.has(v.id)){ids.add(v.id);list.push(v);break}}
+   }
+  }
+  if(list.length){
+   results=list;homeCache={k:key,t:Date.now(),list};msg='';
+   try{localStorage.setItem('ytHome',JSON.stringify(homeCache))}catch(e){}
+  }else if(old&&old.list&&old.list.length){results=old.list;msg=''} // limit bitibsə köhnə lent qalır
+  else msg=tr.error?'Xəta: '+tr.error.message.slice(0,70):'Nəticə yoxdur';
+ }catch(e){if(old&&old.list&&old.list.length){results=old.list;msg=''}else msg='İnternet xətası'}
+ loading=false;
+}
+function moreRes(){feed?moreShorts():doSearch(true)}
+function dur(iso){ // ISO 8601 müddəti saniyəyə
+ if(iso.includes('H')||iso.includes('D'))return 999;
+ const m=iso.match(/PT(?:(\d+)M)?(?:(\d+)S)?/);return m?(+m[1]||0)*60+(+m[2]||0):999;
+}
+async function fillShorts(){ // az/tr Shorts yığır; izlədiyin Shorts-lara görə mövzu da əlavə edir
+ const base='https://www.googleapis.com/youtube/v3/';
+ const seen=new Set([...hist.map(h=>h.id),...shQueue.map(v=>v.id)]);
+ const qs=['#shorts',...topWords(hist.filter(h=>h.s),2).map(w=>'#shorts '+w)];
+ const latin=t=>!/[^\p{Script=Latin}\p{Script=Common}\p{Script=Inherited}]/u.test(t);
+ const buckets=[];let err='';
+ for(const q of qs){
+  for(const days of [60,0]){ // əvvəl son 60 gün, tapılmasa tarixsiz
+   const got=[];
+   await Promise.all([['AZ','az'],['TR','tr']].map(async([rc,lg])=>{
+    try{
+     const j=await (await fetch(base+'search?part=snippet&type=video&videoDuration=short&videoEmbeddable=true&maxResults=25&order='+(days?'viewCount':'relevance')+(days?'&publishedAfter='+new Date(Date.now()-days*864e5).toISOString():'')+'&q='+encodeURIComponent(q)+'&regionCode='+rc+'&relevanceLanguage='+lg+'&key='+YT_KEY)).json();
+     if(j.error)err=j.error.message;else got.push(...(j.items||[]));
+    }catch(e){err='İnternet xətası'}
+   }));
+   const ids=[...new Set(got.map(i=>i.id.videoId))].filter(id=>!seen.has(id)).slice(0,50);
+   if(!ids.length)continue;
+   const d=await (await fetch(base+'videos?part=snippet,contentDetails&id='+ids.join(',')+'&key='+YT_KEY)).json();
+   const b=[];
+   for(const v of d.items||[]){
+    if(dur(v.contentDetails.duration)>60)continue;
+    const lg=(v.snippet.defaultAudioLanguage||v.snippet.defaultLanguage||'').toLowerCase();
+    if(lg?!(lg.startsWith('az')||lg.startsWith('tr')):!latin(v.snippet.title))continue;
+    seen.add(v.id);b.push({id:v.id,title:decode(v.snippet.title),th:v.snippet.thumbnails.medium.url});
+   }
+   if(b.length){buckets.push(b.sort(()=>Math.random()-.5));if(b.length>=8)break}
+  }
+ }
+ while(buckets.some(a=>a.length))for(const a of buckets)if(a.length)shQueue.push(a.shift());
+ saveQueue();
+ return err;
+}
+async function moreShorts(){
+ if(loading)return;loading=true;
+ await fillShorts();
+ const have=new Set(results.map(r=>r.id));
+ results=results.concat(shQueue.filter(v=>!have.has(v.id)));
+ loading=false;
+}
+async function shortsFeed(){
+ feed=true;kbOpen=false;scrollY=0;
+ const hs=new Set(hist.map(h=>h.id));
+ shQueue=shQueue.filter(v=>!hs.has(v.id));
+ if(shQueue.length<6){
+  if(loading)return;
+  loading=true;msg='...';results=[];
+  const err=await fillShorts();loading=false;
+  if(!shQueue.length){msg=err?'Xəta: '+err.slice(0,70):'Nəticə yoxdur';return}
+ }
+ results=shQueue.slice();msg='';nextTok='1';curIdx=0;
+ playIdx(0);
+}
+function voice(){
+ const SR=window.SpeechRecognition||window.webkitSpeechRecognition;
+ if(!SR){msg='Səsli axtarış dəstəklənmir';return}
+ const r=new SR();r.lang=navigator.language||'az-AZ';
+ r.onresult=e=>{query=e.results[0][0].transcript;doSearch()};
+ r.onerror=()=>{msg='Mikrofon xətası'};
+ try{r.start();msg='🎤 Danış...'}catch(e){}
+}
+const rr=(x,y,w,h,r,f)=>{bx.beginPath();bx.roundRect(x,y,w,h,r);bx.fillStyle=f;bx.fill()};
+function btn(x,y,w,h,label,act,dw=1.5,rep=false){
+ hits.push({x,y,w,h,act,dw,rep});
+ const on=bhover&&bhover.x===x&&bhover.y===y;
+ rr(x,y,w,h,12,on?'#3d3d3d':'#262626');
+ bx.fillStyle='#fff';bx.font='bold 30px sans-serif';bx.textAlign='center';bx.textBaseline='middle';
+ bx.fillText(label,x+w/2,y+h/2);
+ if(on){bx.fillStyle='#4fc3f7';bx.fillRect(x,y+h-6,w*Math.min(bT/dw,1),6)}
+}
+function wrap(t,x,y,w,lines,lh){
+ let line='',n=0;
+ for(const wd of t.split(' ')){
+  const test=line?line+' '+wd:wd;
+  if(bx.measureText(test).width>w&&line){bx.fillText(line,x,y+n*lh);n++;line=wd;if(n>=lines)return}
+  else line=test;
+ }
+ if(n<lines)bx.fillText(line,x,y+n*lh);
+}
+function drawBrowse(){
+ hits=[];
+ if(query!==lastSugQ){lastSugQ=query;clearTimeout(sugT);const q0=query;sugT=setTimeout(()=>fetchSug(q0),350)}
+ bx.fillStyle='#0f0f0f';bx.fillRect(0,0,1280,720);
+ btn(40,20,540,70,query?query.slice(-24):'🔍  Axtar...',()=>{kbOpen=!kbOpen});
+ btn(595,20,70,70,'🏠',()=>loadHome(true));
+ btn(680,20,70,70,'🎤',voice);
+ btn(765,20,70,70,'↵',doSearch);
+ btn(850,20,70,70,'▲',()=>{scrollY=Math.max(0,scrollY-285)},0.6,true);
+ btn(935,20,70,70,'▼',()=>{scrollY+=285},0.6,true);
+ btn(1020,20,240,70,'▶ Shorts',shortsFeed);
+ if(kbOpen){
+  KEYS.forEach((row,ri)=>[...row].forEach((ch,ci)=>
+   btn(16+ci*104,120+ri*88,96,80,ch,()=>{query+=ch},1.5,true)));
+  btn(240,384,520,80,'␣',()=>{query+=' '},1.5,true);
+  btn(780,384,200,80,'⌫',()=>{query=query.slice(0,-1)},1.5,true);
+  btn(1000,384,240,80,'Axtar',doSearch);
+  sugs.forEach((sg,i)=>btn(40,472+i*62,1200,56,'🔍 '+sg,()=>{query=sg;doSearch()}));
+  return;
+ }
+ const maxS=Math.max(0,Math.ceil(results.length/3)*285-560);
+ scrollY=Math.min(Math.max(0,scrollY),maxS);
+ if(nextTok&&!loading&&results.length&&scrollY>maxS-150)moreRes();
+ bx.save();bx.beginPath();bx.rect(0,100,1280,620);bx.clip();
+ results.forEach((v,i)=>{
+  const x=40+(i%3)*415,y=110+Math.floor(i/3)*285-scrollY;
+  if(y>720||y+270<100)return;
+  hits.push({x,y,w:390,h:270,act:()=>playIdx(i),dw:1.5,rep:false});
+  const on=bhover&&bhover.x===x&&bhover.y===y;
+  rr(x,y,390,270,10,on?'#2a2a2a':'#181818');
+  const im=img(v.th);if(im.complete&&im.naturalWidth)bx.drawImage(im,x,y,390,219);
+  bx.fillStyle='#fff';bx.font='22px sans-serif';bx.textAlign='left';bx.textBaseline='top';
+  wrap(v.title,x+8,y+224,374,2,26);
+  if(on){bx.fillStyle='#4fc3f7';bx.fillRect(x,y+264,390*Math.min(bT/1.5,1),6)}
+ });
+ bx.restore();
+ if(results.length&&scrollY<maxS){bx.fillStyle='rgba(79,195,247,.3)';bx.fillRect(0,680,1280,40);
+  bx.fillStyle='#fff';bx.font='bold 28px sans-serif';bx.textAlign='center';bx.textBaseline='middle';bx.fillText('▼',640,700)}
+ if(msg){bx.fillStyle='#aaa';bx.font='28px sans-serif';bx.textAlign='center';bx.textBaseline='middle';bx.fillText(msg,640,360)}
+}
+function browseGaze(u,v,dt){
+ if(!kbOpen&&results.length&&v>680&&v<720){scrollY+=320*dt;bhover=null;bT=0;return} // ekranın aşağı hissəsinə baxanda sürüşür
+ const h=hits.find(h=>u>=h.x&&u<=h.x+h.w&&v>=h.y&&v<=h.y+h.h);
+ if(!h){bhover=null;bT=0;bLock=false;return}
+ if(!bhover||bhover.x!==h.x||bhover.y!==h.y){bhover=h;bT=0;bLock=false}
+ if(bLock)return;
+ bT+=dt;
+ if(bT>=h.dw){bT=0;h.act();navigator.vibrate?.(15);if(!h.rep)bLock=true}
+}
+function mountBrowse(){
+ brz=true;bctx.length=0;
+ for(const k of ['pL','pR']){
+  const el=tvEls[k];el.textContent='';
+  const c=document.createElement('canvas');c.className='vc';c.width=1280;c.height=720;
+  el.appendChild(c);bctx.push(c.getContext('2d'));
+ }
+ if(!results.length&&!loading)loadHome();
+}
+function playIdx(i){curIdx=i;swipeCool=performance.now()+2000;playId(results[i].id)}
+function step(d){
+ if(!results.length)return;
+ if(feed&&curIdx>=results.length-4&&!loading)moreShorts();
+ playIdx((curIdx+d+results.length)%results.length);
+}
+function playId(id){
+ if(!window.YT||!YT.Player){msg='YouTube yüklənməyib';return}
+ clearInterval(syncTimer);try{L?.destroy();R?.destroy()}catch(e){}
+ brz=false;
+ for(const k of ['pL','pR']){
+  const el=tvEls[k];el.textContent='';
+  const h=document.createElement('div');el.appendChild(h);holders[k]=h;
+ }
+ startVideo(id);
+ if(feed)shortsMode=true;
+ curId=id;clearTimeout(histT);
+ histT=setTimeout(()=>{ // 5 saniyə baxılıbsa yadda saxla
+  const v=results.find(r=>r.id===id);
+  if(v&&curId===id){
+   hist=hist.filter(h=>h.id!==id).concat({id,t:v.title,s:isShort()?1:0}).slice(-80);
+   try{localStorage.setItem('ytHist',JSON.stringify(hist))}catch(e){}
+  }
+ },5000);
+}
+function backToSearch(){
+ clearInterval(syncTimer);
+ try{L?.destroy();R?.destroy()}catch(e){}
+ L=R=null;
+ if(vid){vid.pause();vid.remove();vid=null;ctxs.length=0;onTap=null}
+ results=[];mountBrowse(); // izlədikdən sonra yenilənmiş ana səhifə
+}
+
+/* ---- Google hesabı ilə giriş (OAuth): abunəliklər və bəyənilənlər ana səhifəyə qoşulur ---- */
+let CLIENT_ID=localStorage.getItem('gcid')||''; // OAuth Client ID: G düyməsinə ilk basanda soruşulur və yadda qalır
+let gTok='',subFeed=[],likedT=[];
+$('gb').style.display='';
+$('gb').onclick=()=>{
+ if(!CLIENT_ID){
+  const v=(prompt('Google OAuth Client ID-ni yapışdır (.apps.googleusercontent.com ilə bitir):')||'').trim();
+  if(v.includes('.apps.googleusercontent.com')){
+   CLIENT_ID=v;try{localStorage.setItem('gcid',v)}catch(e){}
+   alert('Saxlanıldı. İndi G düyməsinə yenidən bas.');
+  }
+  return;
+ }
+ if(!window.google||!google.accounts){alert('Google giriş xidməti yüklənməyib, bir az gözləyib yenidən bas.');return}
+ google.accounts.oauth2.initTokenClient({
+  client_id:CLIENT_ID,scope:'https://www.googleapis.com/auth/youtube.readonly',
+  callback:async r=>{
+   if(!r.access_token)return;
+   gTok=r.access_token;$('gb').style.background='#4caf50';
+   await loadAccountData();
+   if(homeCache)homeCache.t=0;
+  }
+ }).requestAccessToken();
+};
+const GA=async path=>(await fetch('https://www.googleapis.com/youtube/v3/'+path,{headers:{Authorization:'Bearer '+gTok}})).json();
+async function loadAccountData(){
+ try{
+  const lk=await GA('videos?part=snippet&myRating=like&maxResults=25');
+  likedT=(lk.items||[]).map(v=>({id:v.id,t:v.snippet.title,s:0}));
+  const sb=await GA('subscriptions?part=snippet&mine=true&maxResults=50');
+  const chs=(sb.items||[]).map(i=>i.snippet.resourceId.channelId).sort(()=>Math.random()-.5).slice(0,12);
+  const arr=await Promise.all(chs.map(c=>GA('playlistItems?part=snippet&maxResults=3&playlistId=UU'+c.slice(2))));
+  let v=arr.flatMap(j=>(j.items||[]).map(it=>({id:it.snippet.resourceId.videoId,title:decode(it.snippet.title),
+   th:((it.snippet.thumbnails||{}).medium||(it.snippet.thumbnails||{}).default||{}).url,d:it.snippet.publishedAt}))).filter(x=>x.th&&x.id);
+  const st=await GA('videos?part=status&id='+v.slice(0,50).map(x=>x.id).join(','));
+  const ok=new Set((st.items||[]).filter(x=>x.status&&x.status.embeddable).map(x=>x.id));
+  subFeed=v.filter(x=>ok.has(x.id)).sort((a,b)=>b.d.localeCompare(a.d));
+ }catch(e){}
+}
+
+/* ---- Başlat düyməsi ---- */
+$('go').onclick=async()=>{
+ const url=$('link').value.trim(),vf=null;
+ let kind,src;
+ const yt=url.match(/(?:v=|youtu\.be\/|shorts\/|embed\/|live\/)([\w-]{11})/);
+ const vm=url.match(/vimeo\.com\/(?:video\/)?(\d+)/),dm=url.match(/dailymotion\.com\/video\/([a-z0-9]+)/i);
+ if(vf){kind='file';src=URL.createObjectURL(vf)}
+ else if(yt&&/youtube\.com|youtu\.be/.test(url)){kind='yt';src=yt[1]}
+ else if(vm){kind='vimeo';src=vm[1]}
+ else if(dm){kind='dm';src=dm[1]}
+ else if(/^https?:\/\/\S+\.(mp4|webm|ogv|mov|m4v|m3u8)(\?\S*)?$/i.test(url)){kind='file';src=url}
+ else if(!url){kind='browse';src=''}
+ else{alert('Bu link dəstəklənmir. İşləyənlər: YouTube, Vimeo, Dailymotion, birbaşa video faylı linki (.mp4/.webm/.m3u8) və ya telefondan seçilmiş video.');return}
+ if(kind==='browse'){try{const st=await navigator.mediaDevices.getUserMedia({audio:true});st.getTracks().forEach(t=>t.stop())}catch(e){}} // səsli axtarış icazəsi
+ if((kind==='yt'||kind==='browse')&&(!window.YT||!YT.Player)){alert('YouTube hələ yüklənməyib, bir az gözləyib yenidən bas');return}
+ // iOS üçün sensor icazəsi (Android-də lazım deyil)
+ if(typeof DeviceOrientationEvent!=='undefined'&&DeviceOrientationEvent.requestPermission){
+  try{await DeviceOrientationEvent.requestPermission()}catch(e){}
+ }
+ try{await document.documentElement.requestFullscreen()}catch(e){}
+ try{await screen.orientation.lock('landscape')}catch(e){}
+ try{await navigator.wakeLock?.request('screen')}catch(e){} // ekran sönməsin
+ startSensor();
+ showTheme(idx);
+ $('ui').style.display='none';
+ $('eyes').style.display='block';
+ resize();
+ renderer.setAnimationLoop(loop);
+ setTimeout(()=>{kind==='browse'?mountBrowse():kind==='yt'?startVideo(src):kind==='file'?startFile(src):startEmbed(kind,src)},500);
+};
+</script>
+</body></html>
